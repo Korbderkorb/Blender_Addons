@@ -6,7 +6,7 @@ there is no shared dependency between them.
 
 | Add-on | Version | Description |
 | --- | --- | --- |
-| [Point Cloud Master Suite](#point-cloud-master-suite) | 1.8.0 | Generate, clean, segment, measure, grow, fill and boolean-cut point clouds |
+| [Point Cloud Master Suite](#point-cloud-master-suite) | 1.9.0 | Generate, clean, segment, measure, grow, fill, boolean-cut and visualize point clouds |
 
 More add-ons will be added to this repository over time.
 
@@ -48,16 +48,18 @@ or clouds generated from video right inside the add-on.
 
 **Requirements:** Developed and tested against Blender 5.0. The add-on manifest allows
 3.6 and newer, but only 5.0 has been verified. Progress bars need Blender 4.0 or newer;
-older versions show the progress as text instead. No external Python packages are
-needed — NumPy ships with Blender.
+older versions show the progress as text instead. The **Visualize** section needs
+Blender 5.0 or newer; everything else runs on 3.6 and up. No external Python packages
+are needed — NumPy ships with Blender.
 
-The sidebar tab has three sections, each with its own tools:
+The sidebar tab has four sections, each with its own tools:
 
 | Section | Tools | What they do |
 | --- | --- | --- |
 | **Generate** | Video Stack | Turn a video into a stacked 3D point cloud |
 | **Select** | Spatial, Thickness, Spectrum | Find points by neighbourhood, by material thickness or by colour |
 | **Modify** | Analyze Lattice, Rescale, Growth, Fill Volume, Boolean | Measure the grid a cloud sits on and build on it |
+| **Visualize** | Visualize, Size by Attribute | Show a cloud as real points, coloured and sized by its stored values |
 
 **Before you start:** some tools change the point cloud in place (Trash, Rescale, Grow,
 Intersect, Difference). Duplicate your object (`Shift + D`, `Esc`) before a destructive
@@ -358,10 +360,85 @@ volumes fast.
 
 ---
 
+## Visualize
+
+Shows a point cloud as real, round points in its own colours — in the viewport and in
+Cycles and EEVEE renders — with one click. Requires **Blender 5.0 or newer**.
+
+Visualize adds a Geometry Nodes modifier to the cloud; the mesh itself is never changed,
+so every other tool in the suite keeps working on the cloud while it is shown. The
+modifier is kept last in the stack and is switched off in Edit Mode, where you see the
+bare vertices.
+
+### Visualize
+
+1. **Visualize.** Select one or more clouds and press the button. A viewport in Solid or
+   Wireframe is switched to Material Preview so the colours show straight away. Pressing
+   it again hides the points and keeps every setting; the **✕** next to it removes the
+   modifier.
+2. **Size.** Counted in point spacings, so `1` makes neighbouring points just touch,
+   whether the cloud is a millimetre or a kilometre across. The spacing is measured when
+   Visualize is turned on and shown below the field. The refresh button beside *Size*
+   measures it again — use it after Rescale, Fill Volume or Growth changed the spacing.
+3. **Color By.**
+   - **True Color** (default) — the cloud's colour attribute (`Col`, or whichever you
+     pick), shown unchanged. *Brightness* and *Saturation* adjust it.
+   - **Heatmap** — colours the points by a stored value. Palettes: Turbo, Viridis, Blue to
+     Red, Grayscale.
+   - **ID Colors** — a colour of its own for every cluster id (`cluster_id_dist`,
+     `cluster_id_color`). *Seed* reshuffles the colours.
+   - **Solid** — one colour for every point, to judge the size alone. A cloud without
+     colours starts here.
+4. **Unlit / Shaded.** *Unlit* shows the exact colours without light or shadow; *Shaded*
+   lights the points like any surface, for renders.
+5. **Viewport Density.** Draws only a share of the points in the viewport, to keep huge
+   clouds smooth to orbit. Renders always use every point.
+
+### Heatmaps read stored values
+
+The heatmap and the size influences only read attributes already on the cloud —
+`pc_thickness`, `pc_color_score`, `pc_lattice_residual`, the cluster ids, `frame`, or
+anything you imported. Nothing is recomputed: changing the range, curve or palette updates
+the view at once. If the value you pick is missing, the panel tells you which tool makes
+it, for example *run Select > Thickness > Analyze*.
+
+Every value is mapped through the same remap block:
+
+- **Min / Max** — the range of values used. **Auto** (and picking a value) sets it to the
+  2nd–98th percentile, so a few outliers do not flatten the rest. The real range of the
+  value is shown below. A range set by hand is left alone.
+- **Linear / Smooth / Steps** — how values are spread over the range. *Steps* sets the
+  number of bands.
+- **Invert** (⇆) swaps the ends. Picking `pc_thickness` turns it on, so thin parts come
+  out hot and large.
+
+### Size by Attribute
+
+A sub-panel under Visualize, closed until you need it.
+
+- **Scale by** picks a stored value that scales the points, from **Low ×** to **High ×**
+  of their size. *None* turns it off.
+- **And by** appears once the first is on and adds a second value; the two multiply.
+- **Hide Below** leaves out points scaled below a given multiplier, to show only part of
+  the cloud.
+
+### Under the hood
+
+One node group (`PC Visualize`, using `PC Visualize Remap`) and two materials
+(`PC Visualize Unlit` / `PC Visualize Shaded`) are shared by every cloud in the file. Each
+cloud's settings live only in its own modifier, so the sidebar and the Modifier tab always
+agree, and a setting changed in either place shows up in the other. The computed colour is
+stored as `pc_viz_color`, which is the only attribute the materials read.
+
+---
+
 ## Changelog
 
 See the release notes on GitHub for details. In short:
 
+- **1.9.0** — New **Visualize** section: one-click point display in Cycles and EEVEE,
+  live heatmaps from stored values, ID colours, and point size driven by up to two
+  attributes. Spectrum colour-attribute dropdown fix.
 - **1.8.0** — Progress bar and Cancel button on every tool; Boolean **Invert**; Tile
   Override checkbox in Fill Volume; Split keeps attributes and transform.
 - **1.7.0** — Seamless mirroring in Fill Volume fixed on all axes; Fill and Trim / Cover

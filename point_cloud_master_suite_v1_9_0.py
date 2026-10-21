@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Point Cloud Master Suite",
     "author": "Korbinian Enzinger",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > PC Tools",
-    "description": "Comprehensive toolkit for generating point clouds from video, clustering, color filtering, thin part detection, and boolean cutting against a closed mesh.",
+    "description": "Comprehensive toolkit for generating point clouds from video, clustering, color filtering, thin part detection, boolean cutting against a closed mesh, and visualizing clouds by color and attribute.",
     "warning": "",
     "category": "Mesh",
 }
@@ -5485,6 +5485,937 @@ class MESH_OT_BooleanDifference(PC_BooleanBase, bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     operation = 'DIFFERENCE'
 
+# --- 1i. VISUALIZE LOGIC ---
+#
+# Shows a cloud as round points, colored and sized from its attributes. It
+# is all one Geometry Nodes modifier, so the mesh itself is never touched and
+# every other tool keeps working on it while it is shown. One node group and
+# two materials are shared by every cloud in the file, and each cloud's own
+# settings are the inputs of its modifier, which is what the Visualize panel
+# draws. The modifier is the only place they are kept, so the panel and the
+# modifier tab can never disagree.
+#
+# The color is worked out inside the node group and stored as
+# VIZ_COLOR_ATTR, so the materials only ever read that one name, whichever
+# attribute it came from. Nothing here measures anything: the heatmap and the
+# size influences read values that other tools have already stored.
+
+VIZ_GROUP = "PC Visualize"
+VIZ_REMAP_GROUP = "PC Visualize Remap"
+VIZ_MODIFIER = "PC Visualize"
+VIZ_COLOR_ATTR = "pc_viz_color"
+VIZ_MATERIALS = ("PC Visualize Unlit", "PC Visualize Shaded")
+# Kept on the node groups and materials. Bumped whenever their nodes change,
+# so a cloud still on an older group is moved onto a freshly built one
+VIZ_VERSION = 1
+# The node features this is built from are only all there from 5.0 on
+VIZ_MIN_BLENDER = (5, 0, 0)
+
+VIZ_COLOR_MODES = ("True Color", "Heatmap", "ID Colors", "Solid")
+VIZ_SHADING = ("Unlit", "Shaded")
+VIZ_CURVES = ("Linear", "Smooth", "Steps")
+# The heatmap palettes as sRGB stops, spread evenly from low to high
+VIZ_PALETTES = {
+    "Turbo": ("30123b", "4675ed", "1bcfd4", "61fc6c", "d1e834", "fe9b2d",
+              "d93806", "7a0402"),
+    "Viridis": ("440154", "46327e", "365c8d", "277f8e", "1fa187", "4ac16d",
+                "a0da39", "fde725"),
+    "Blue to Red": ("3b4cc0", "88abfd", "dddddd", "f49a7b", "b40426"),
+    "Grayscale": ("000000", "ffffff"),
+}
+VIZ_INFLUENCES = ("Influence 1", "Influence 2")
+VIZ_COLOR_TYPES = ('FLOAT_COLOR', 'BYTE_COLOR')
+# The attribute kinds a heatmap or a size influence can read as one number
+VIZ_NUMERIC_TYPES = ('FLOAT', 'INT', 'INT8', 'BOOLEAN')
+VIZ_ID_TYPES = ('INT', 'INT8')
+# Which tool writes the values the suite knows about, for the hint shown
+# when a cloud does not have them yet
+VIZ_SOURCES = {
+    THIN_ATTR: "Select > Thickness > Analyze",
+    "pc_color_score": "Select > Spectrum > Analyze",
+    GRID_RESIDUAL_ATTR: "Modify > Analyze Lattice",
+    "cluster_id_dist": "Select > Spatial > Cluster",
+    "cluster_id_color": "Select > Spectrum > Cluster",
+    VIDEO_FRAME_ATTR: "Generate > Video Stack",
+}
+# Values where the low end is the one worth seeing, so picking them turns
+# Invert on: thin parts come out hot and big rather than cold and small
+VIZ_LOW_IS_HOT = {THIN_ATTR}
+# The range each heatmap or influence was last fitted to, with the values it
+# found, as (object name, panel): (attribute, smallest, largest). Only for
+# the hint under the range, so losing it on reload costs nothing.
+VIZ_RANGES = {}
+
+
+def viz_inputs():
+    """Every input of the node group, in the order the modifier shows them,
+    as (panel, name, socket type, settings). Panel None is the top level."""
+    F, I, B = 'NodeSocketFloat', 'NodeSocketInt', 'NodeSocketBool'
+    C, M = 'NodeSocketColor', 'NodeSocketMenu'
+
+    def remap(panel, what):
+        return [
+            (panel, "Source", F, dict(field=True, tip=(
+                f"The values {what}. Only read, never changed, so it has "
+                f"to be stored on the cloud already, by Analyze, Cluster "
+                f"or an import"))),
+            (panel, "From Min", F, dict(default=0.0, tip=(
+                "Values at or below this sit at the low end. Auto sets it "
+                "from the cloud, ignoring the lowest 2% as outliers"))),
+            (panel, "From Max", F, dict(default=1.0, tip=(
+                "Values at or above this sit at the high end. Auto sets it "
+                "from the cloud, ignoring the highest 2% as outliers"))),
+            (panel, "Curve", M, dict(default="Linear", tip=(
+                "How the values are spread between the two ends: Linear "
+                "evenly, Smooth eased in and out to stress the middle, "
+                "Steps in a few flat bands"))),
+            (panel, "Steps", I, dict(default=5, min=1, max=64, tip=(
+                "Number of bands with the Steps curve"))),
+            (panel, "Invert", B, dict(default=False, tip=(
+                "Swap the two ends, so low values get the high end"))),
+        ]
+
+    spec = [
+        (None, "Spacing", F, dict(default=0.01, min=0.0, subtype='DISTANCE',
+            tip="Distance between neighbouring points, measured from the "
+                "cloud when Visualize is turned on and by the refresh "
+                "button beside Size. Size counts in this")),
+        (None, "Size", F, dict(default=1.0, min=0.0, max=100.0, tip=(
+            "Point size in point spacings. 1 makes neighbouring points "
+            "just touch, 0.5 leaves a gap between them, 2 makes them "
+            "overlap. Works the same for a cloud of any scale"))),
+        (None, "Color By", M, dict(default="True Color", tip=(
+            "True Color shows the cloud's own color attribute. Heatmap "
+            "colors it by stored values like the thickness. ID Colors "
+            "gives every cluster a color of its own. Solid uses one color "
+            "for all, to read the size alone"))),
+        (None, "Shading", M, dict(default="Unlit", tip=(
+            "Unlit shows the exact colors, without light or shadow. Shaded "
+            "lights the points like any surface, for renders"))),
+        ("True Color", "Color", C, dict(field=True, attribute="Col", tip=(
+            "The color attribute to show"))),
+        ("True Color", "Brightness", F, dict(default=1.0, min=0.0,
+            max=10.0, tip="Multiplies the brightness of the colors")),
+        ("True Color", "Saturation", F, dict(default=1.0, min=0.0,
+            max=10.0, tip="Multiplies the saturation of the colors, 0 "
+                          "shows them in gray")),
+    ]
+    spec += remap("Heatmap", "colored")
+    spec += [
+        ("Heatmap", "Palette", M, dict(default="Turbo", tip=(
+            "The colors running from the low end to the high end"))),
+        ("ID Colors", "ID", I, dict(field=True, tip=(
+            "Whole number attribute naming the group of each point, a "
+            "cluster id for one. Every id gets a color of its own"))),
+        ("ID Colors", "Seed", I, dict(default=0, tip=(
+            "Deals out other colors, for when two neighbours came out "
+            "alike"))),
+        ("Solid", "Solid Color", C, dict(default=(0.8, 0.8, 0.8, 1.0),
+            tip="The one color every point gets")),
+    ]
+    for panel in VIZ_INFLUENCES:
+        # Blender names a panel's switch after the panel; viz_ids finds it
+        # as "Use" too
+        spec.append((panel, "Use", B, dict(default=False, toggle=True, tip=(
+            "Scale the points by stored values"))))
+        spec += remap(panel, "that scale the points")
+        spec += [
+            (panel, "Smallest", F, dict(default=0.25, min=0.0, max=100.0,
+                tip="Size multiplier at the low end of the range")),
+            (panel, "Largest", F, dict(default=2.0, min=0.0, max=100.0,
+                tip="Size multiplier at the high end of the range")),
+        ]
+    spec += [
+        ("Display", "Hide Below", F, dict(default=0.0, min=0.0, max=100.0,
+            tip="Leaves out points the size influences scale below this "
+                "multiplier, to show only part of the cloud. 0 keeps all "
+                "of them")),
+        ("Display", "Viewport Density", F, dict(default=1.0, min=0.0,
+            max=1.0, subtype='FACTOR', tip=(
+            "Share of the points drawn in the viewport, to keep a very "
+            "large cloud quick to turn. Renders always use every point"))),
+    ]
+    return spec
+
+
+def viz_hex_color(code):
+    """A 'rrggbb' sRGB code as a linear RGBA color, the way ramps hold it."""
+    rgb = [int(code[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    return tuple(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+                 for c in rgb) + (1.0,)
+
+
+def viz_tagged(blocks, tag, role=None):
+    """The block carrying tag at the current version, and role if given."""
+    for block in blocks:
+        if block.get(tag) == VIZ_VERSION and (role is None
+                                              or block.get("pc_viz_role") == role):
+            return block
+    return None
+
+
+def _pin(sockets, name, nth=0):
+    """The nth socket called name the node uses. Nodes keep one socket per
+    data type under the same name and switch off the ones not in use."""
+    return [s for s in sockets if s.name == name and s.enabled][nth]
+
+
+class VizNodes:
+    """Adds nodes to a group and wires them, which keeps the builders short.
+
+    A value handed to feed is linked when it is a socket and typed into
+    the input when it is not.
+    """
+
+    def __init__(self, group):
+        self.group = group
+
+    def add(self, kind, at, **settings):
+        node = self.group.nodes.new(kind)
+        node.location = at
+        for key, value in settings.items():
+            setattr(node, key, value)
+        return node
+
+    def feed(self, node, inputs):
+        for name, value in inputs.items():
+            target = node.inputs[name] if isinstance(name, int) else _pin(
+                node.inputs, name)
+            if isinstance(value, bpy.types.NodeSocket):
+                self.group.links.new(value, target)
+            else:
+                target.default_value = value
+        return node
+
+    def math(self, operation, a, b, at):
+        node = self.add('ShaderNodeMath', at, operation=operation)
+        return self.feed(node, {0: a, 1: b}).outputs[0]
+
+    def menu(self, data_type, items, menu, values, at):
+        """A Menu Switch over items, picking from values by item name."""
+        node = self.add('GeometryNodeMenuSwitch', at, data_type=data_type)
+        node.enum_items.clear()
+        for item in items:
+            node.enum_items.new(item)
+        self.group.links.new(menu, node.inputs[0])
+        for item in items:
+            target = node.inputs[item]
+            value = values[item]
+            if isinstance(value, bpy.types.NodeSocket):
+                self.group.links.new(value, target)
+            else:
+                target.default_value = value
+        return node.outputs[0]
+
+
+def viz_build_remap():
+    """The node group turning a value into 0 to 1 over a range and a curve.
+
+    Shared by the heatmap and both size influences, so all three behave
+    the same and a fix lands in all of them at once.
+    """
+    group = bpy.data.node_groups.new(VIZ_REMAP_GROUP, 'GeometryNodeTree')
+    group["pc_viz_remap"] = VIZ_VERSION
+    iface = group.interface
+    for name, kind in (("Value", 'NodeSocketFloat'),
+                       ("From Min", 'NodeSocketFloat'),
+                       ("From Max", 'NodeSocketFloat'),
+                       ("Curve", 'NodeSocketMenu'),
+                       ("Steps", 'NodeSocketInt'),
+                       ("Invert", 'NodeSocketBool')):
+        iface.new_socket(name, in_out='INPUT', socket_type=kind)
+    iface.new_socket("Factor", in_out='OUTPUT', socket_type='NodeSocketFloat')
+
+    n = VizNodes(group)
+    gi = n.add('NodeGroupInput', (-700, 0))
+    go = n.add('NodeGroupOutput', (500, 0))
+    put = {s.name: s for s in gi.outputs}
+
+    linear = n.feed(n.add('ShaderNodeMapRange', (-450, 100), clamp=True), {
+        "Value": put["Value"], "From Min": put["From Min"],
+        "From Max": put["From Max"], "To Min": 0.0, "To Max": 1.0})
+    t = linear.outputs["Result"]
+    smooth = n.feed(n.add('ShaderNodeMapRange', (-200, 100),
+                          interpolation_type='SMOOTHSTEP'), {"Value": t})
+    steps = n.feed(n.add('ShaderNodeMapRange', (-200, -150),
+                         interpolation_type='STEPPED'),
+                   {"Value": t, "Steps": put["Steps"]})
+    curved = n.menu('FLOAT', VIZ_CURVES, put["Curve"], {
+        "Linear": t, "Smooth": smooth.outputs["Result"],
+        "Steps": steps.outputs["Result"]}, (50, 0))
+    flipped = n.math('SUBTRACT', 1.0, curved, (50, -200))
+    invert = n.feed(n.add('GeometryNodeSwitch', (300, 0), input_type='FLOAT'),
+                    {"Switch": put["Invert"], "False": curved,
+                     "True": flipped})
+    group.links.new(invert.outputs[0], go.inputs[0])
+    iface.items_tree["Curve"].default_value = "Linear"
+    return group
+
+
+def viz_build_group():
+    """The modifier's node group: mesh in, colored and sized points out."""
+    remap = viz_tagged(bpy.data.node_groups, "pc_viz_remap") or viz_build_remap()
+    group = bpy.data.node_groups.new(VIZ_GROUP, 'GeometryNodeTree')
+    group.is_modifier = True
+    group["pc_viz"] = VIZ_VERSION
+    iface = group.interface
+    iface.new_socket("Geometry", in_out='INPUT',
+                     socket_type='NodeSocketGeometry')
+    iface.new_socket("Geometry", in_out='OUTPUT',
+                     socket_type='NodeSocketGeometry')
+
+    panels, sockets, menus = {}, {}, {}
+    for panel, name, kind, opts in viz_inputs():
+        parent = None
+        if panel is not None:
+            parent = panels.get(panel)
+            if parent is None:
+                parent = panels[panel] = iface.new_panel(
+                    panel, default_closed=True)
+        sock = iface.new_socket(name, in_out='INPUT', socket_type=kind,
+                                parent=parent)
+        sock.description = opts.get("tip", "")
+        if kind != 'NodeSocketMenu' and "default" in opts:
+            sock.default_value = opts["default"]
+        if "min" in opts:
+            sock.min_value = opts["min"]
+        if "max" in opts:
+            sock.max_value = opts["max"]
+        if "subtype" in opts:
+            sock.subtype = opts["subtype"]
+        if opts.get("toggle"):
+            sock.is_panel_toggle = True
+        if kind != 'NodeSocketMenu':
+            # A plain setting takes a value only; the sources take an
+            # attribute, which the modifier offers a picker for
+            sock.structure_type = 'FIELD' if opts.get("field") else 'SINGLE'
+        if opts.get("attribute"):
+            sock.default_attribute_name = opts["attribute"]
+        sockets[(panel, name)] = sock
+        if kind == 'NodeSocketMenu':
+            menus[sock] = opts["default"]
+
+    n = VizNodes(group)
+    gi = n.add('NodeGroupInput', (-1800, 0))
+    go = n.add('NodeGroupOutput', (900, 0))
+    by_id = {s.identifier: s for s in gi.outputs}
+
+    def put(panel, name):
+        return by_id[sockets[(panel, name)].identifier]
+
+    def remapped(panel, at):
+        node = n.add('GeometryNodeGroup', at, node_tree=remap)
+        return n.feed(node, {
+            "Value": put(panel, "Source"), "From Min": put(panel, "From Min"),
+            "From Max": put(panel, "From Max"), "Curve": put(panel, "Curve"),
+            "Steps": put(panel, "Steps"), "Invert": put(panel, "Invert"),
+        }).outputs[0]
+
+    # Size: spacing, times Size, times each influence that is in use
+    factor = None
+    for row, panel in enumerate(VIZ_INFLUENCES):
+        y = -900 - row * 300
+        t = remapped(panel, (-1400, y))
+        scaled = n.feed(n.add('ShaderNodeMapRange', (-1150, y)), {
+            "Value": t, "To Min": put(panel, "Smallest"),
+            "To Max": put(panel, "Largest")})
+        used = n.feed(n.add('GeometryNodeSwitch', (-900, y),
+                            input_type='FLOAT'),
+                      {"Switch": put(panel, "Use"), "False": 1.0,
+                       "True": scaled.outputs["Result"]}).outputs[0]
+        factor = used if factor is None else n.math('MULTIPLY', factor, used,
+                                                    (-650, y))
+    base = n.math('MULTIPLY', put(None, "Spacing"), put(None, "Size"),
+                  (-650, -600))
+    half = n.math('MULTIPLY', base, 0.5, (-450, -600))
+    radius = n.math('MULTIPLY', half, factor, (-250, -700))
+
+    # Which points to draw: big enough, and in the viewport density's share
+    big = n.feed(n.add('FunctionNodeCompare', (-450, -1050), data_type='FLOAT',
+                       operation='GREATER_EQUAL'),
+                 {"A": factor, "B": put("Display", "Hide Below")}).outputs[0]
+    viewport = n.add('GeometryNodeIsViewport', (-650, -1300)).outputs[0]
+    share = n.feed(n.add('FunctionNodeRandomValue', (-650, -1400),
+                         data_type='BOOLEAN'),
+                   {"Probability": put("Display", "Viewport Density")})
+    thinned = n.feed(n.add('FunctionNodeBooleanMath', (-450, -1300),
+                           operation='IMPLY'),
+                     {0: viewport, 1: _pin(share.outputs, "Value")})
+    keep = n.feed(n.add('FunctionNodeBooleanMath', (-250, -1100),
+                        operation='AND'),
+                  {0: big, 1: thinned.outputs[0]}).outputs[0]
+
+    # Color: the four ways of coloring, picked by Color By
+    hsv = n.feed(n.add('FunctionNodeSeparateColor', (-1400, 500), mode='HSV'),
+                 {"Color": put("True Color", "Color")})
+    true_color = n.feed(n.add('FunctionNodeCombineColor', (-900, 500),
+                              mode='HSV'), {
+        0: hsv.outputs[0],
+        1: n.math('MULTIPLY', hsv.outputs[1], put("True Color", "Saturation"),
+                  (-1150, 550)),
+        2: n.math('MULTIPLY', hsv.outputs[2], put("True Color", "Brightness"),
+                  (-1150, 400)),
+        3: hsv.outputs[3]}).outputs[0]
+
+    heat = remapped("Heatmap", (-1400, 150))
+    ramps = {}
+    for row, (name, stops) in enumerate(VIZ_PALETTES.items()):
+        ramp = n.add('ShaderNodeValToRGB', (-1150, 250 - row * 230))
+        elements = ramp.color_ramp.elements
+        while len(elements) < len(stops):
+            elements.new(1.0)
+        for i, code in enumerate(stops):
+            elements[i].position = i / (len(stops) - 1)
+            elements[i].color = viz_hex_color(code)
+        n.feed(ramp, {0: heat})
+        ramps[name] = ramp.outputs[0]
+    palette = n.menu('RGBA', tuple(VIZ_PALETTES), put("Heatmap", "Palette"),
+                     ramps, (-850, 150))
+
+    hue = n.feed(n.add('FunctionNodeRandomValue', (-1150, -350),
+                       data_type='FLOAT'),
+                 {"ID": put("ID Colors", "ID"),
+                  "Seed": put("ID Colors", "Seed")})
+    id_color = n.feed(n.add('FunctionNodeCombineColor', (-900, -350),
+                            mode='HSV'),
+                      {0: _pin(hue.outputs, "Value"), 1: 0.75, 2: 0.85,
+                       3: 1.0}).outputs[0]
+
+    color = n.menu('RGBA', VIZ_COLOR_MODES, put(None, "Color By"), {
+        "True Color": true_color, "Heatmap": palette, "ID Colors": id_color,
+        "Solid": put("Solid", "Solid Color")}, (-500, 200))
+
+    # The color is stored on the mesh, where every source attribute is in
+    # reach whatever its domain, and travels on to the points from there
+    store = n.feed(n.add('GeometryNodeStoreNamedAttribute', (-200, 200),
+                         data_type='FLOAT_COLOR', domain='POINT'),
+                   {"Geometry": gi.outputs[0], "Name": VIZ_COLOR_ATTR,
+                    "Value": color})
+    points = n.feed(n.add('GeometryNodeMeshToPoints', (100, 0),
+                          mode='VERTICES'),
+                    {"Mesh": store.outputs[0], "Selection": keep,
+                     "Radius": radius})
+    material = n.menu('MATERIAL', VIZ_SHADING, put(None, "Shading"), {
+        "Unlit": viz_material(0), "Shaded": viz_material(1)}, (300, -200))
+    shaded = n.feed(n.add('GeometryNodeSetMaterial', (600, 0)),
+                    {"Geometry": points.outputs[0], "Material": material})
+    group.links.new(shaded.outputs[0], go.inputs[0])
+
+    # Menus learn their items from the switch they feed, so their defaults
+    # can only be set once everything is wired
+    for sock, default in menus.items():
+        sock.default_value = default
+    return group
+
+
+def viz_material(role):
+    """The shared Unlit (0) or Shaded (1) material, built when missing.
+
+    Both only read VIZ_COLOR_ATTR, so one pair serves every cloud. A
+    material that was built before is used as it is, edits and all.
+    """
+    found = viz_tagged(bpy.data.materials, "pc_viz", role)
+    if found is not None:
+        return found
+    mat = bpy.data.materials.new(VIZ_MATERIALS[role])
+    mat["pc_viz"] = VIZ_VERSION
+    mat["pc_viz_role"] = role
+    tree = mat.node_tree
+    tree.nodes.clear()
+    attr = tree.nodes.new('ShaderNodeAttribute')
+    attr.attribute_type = 'GEOMETRY'
+    attr.attribute_name = VIZ_COLOR_ATTR
+    attr.location = (-500, 0)
+    out = tree.nodes.new('ShaderNodeOutputMaterial')
+    out.location = (300, 0)
+    if role == 0:
+        shader = tree.nodes.new('ShaderNodeEmission')
+        tree.links.new(attr.outputs["Color"], shader.inputs["Color"])
+        shader.inputs["Strength"].default_value = 1.0
+        tree.links.new(shader.outputs[0], out.inputs["Surface"])
+    else:
+        shader = tree.nodes.new('ShaderNodeBsdfPrincipled')
+        tree.links.new(attr.outputs["Color"], shader.inputs["Base Color"])
+        shader.inputs["Roughness"].default_value = 0.6
+        tree.links.new(shader.outputs[0], out.inputs["Surface"])
+    shader.location = (0, 0)
+    return mat
+
+
+def viz_group():
+    """The current node group, built the first time it is needed."""
+    return viz_tagged(bpy.data.node_groups, "pc_viz") or viz_build_group()
+
+
+def viz_modifier(obj):
+    """The Visualize modifier on obj, of any version, or None."""
+    if obj is None or obj.type != 'MESH':
+        return None
+    for mod in obj.modifiers:
+        if (mod.type == 'NODES' and mod.node_group is not None
+                and mod.node_group.get("pc_viz") is not None):
+            return mod
+    return None
+
+
+def viz_ids(group):
+    """{(panel, name): socket identifier} for every input of the group."""
+    ids = {}
+    for item in group.interface.items_tree:
+        if item.item_type == 'SOCKET' and item.in_out == 'INPUT':
+            parent = item.parent
+            panel = parent.name if parent is not None and parent.name else None
+            ids[(panel, item.name)] = item.identifier
+            if item.is_panel_toggle:
+                # A panel's switch takes the panel's own name
+                ids[(panel, "Use")] = item.identifier
+    return ids
+
+
+def viz_key(mod, panel, name):
+    """The modifier property holding one input, as mod[key] reads it."""
+    return viz_ids(mod.node_group)[(panel, name)]
+
+
+def viz_get(mod, panel, name, default=None):
+    return mod.get(viz_key(mod, panel, name), default)
+
+
+def viz_menu_values(mod, panel, name):
+    """{item: stored value} of a menu input. The modifier stores the id
+    the Menu Switch gave the item, which is not its place in the list."""
+    key = viz_key(mod, panel, name)
+    try:
+        items = mod.id_properties_ui(key).as_dict().get("items", ())
+    except TypeError:
+        return {}
+    return {item[1]: item[4] for item in items}
+
+
+def viz_menu(mod, panel, name, items):
+    """The item a menu input is set to, one of items."""
+    value = viz_get(mod, panel, name)
+    for item, stored in viz_menu_values(mod, panel, name).items():
+        if stored == value and item in items:
+            return item
+    return items[0]
+
+
+def viz_set_menu(obj, mod, panel, name, item):
+    viz_set(obj, mod, panel, name, viz_menu_values(mod, panel, name)[item])
+
+
+def viz_set(obj, mod, panel, name, value):
+    """Writes one input. Written from Python the modifier is not told, so
+    the object is tagged to have it run again."""
+    mod[viz_key(mod, panel, name)] = value
+    obj.update_tag()
+
+
+def viz_attribute(mod, panel, name):
+    """The attribute name a source input reads, '' if it reads none."""
+    key = viz_key(mod, panel, name)
+    if not mod.get(key + "_use_attribute", False):
+        return ""
+    return mod.get(key + "_attribute_name", "")
+
+
+def viz_set_attribute(obj, mod, panel, name, attribute):
+    key = viz_key(mod, panel, name)
+    mod[key + "_use_attribute"] = True
+    mod[key + "_attribute_name"] = attribute
+    obj.update_tag()
+
+
+def viz_targets(context):
+    """The meshes Visualize acts on: the active one first, then the rest of
+    the selection."""
+    found = []
+    active = context.active_object
+    if active is not None and active.type == 'MESH':
+        found.append(active)
+    for obj in getattr(context, "selected_objects", ()):
+        if obj.type == 'MESH' and obj not in found:
+            found.append(obj)
+    return found
+
+
+def viz_spacing(obj):
+    """The point spacing of obj in its own space, which is the space the
+    modifier sizes the points in, so object scale needs no care."""
+    if obj.mode == 'EDIT':
+        obj.update_from_editmode()
+    mesh = obj.data
+    coords = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", coords)
+    coords = coords.reshape(-1, 3)
+    spacing = estimate_point_spacing(coords) if len(coords) > 1 else 0.0
+    if spacing <= 0.0:
+        # A single point, or all of them in one spot: a hundredth of the
+        # box, or of a unit when there is no box either
+        extent = float(np.ptp(coords, axis=0).max()) if len(coords) else 0.0
+        spacing = extent / 100.0 if extent > 0.0 else 0.01
+    return spacing
+
+
+def viz_values(obj, name):
+    """The named attribute as one float per element, or None if the cloud
+    has no number of that name."""
+    if not name:
+        return None
+    if obj.mode == 'EDIT':
+        obj.update_from_editmode()
+    attr = obj.data.attributes.get(name)
+    if attr is None or attr.data_type not in VIZ_NUMERIC_TYPES:
+        return None
+    size, prop, dtype = BOOL_ATTR_LAYOUT[attr.data_type]
+    values = np.empty(len(attr.data) * size, dtype=dtype)
+    attr.data.foreach_get(prop, values)
+    return values.astype(np.float64)
+
+
+def viz_auto_range(obj, mod, panel):
+    """Fits From Min and From Max of panel to the values it reads.
+
+    The 2nd and 98th percentile rather than the extremes, so a handful of
+    strays cannot squeeze everything else into one color. Measured on at
+    most a million points, which is plenty for a percentile. Returns the
+    (low, high) set, or None if there was nothing to read.
+    """
+    name = viz_attribute(mod, panel, "Source")
+    values = viz_values(obj, name)
+    if values is None:
+        return None
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return None
+    sample = values
+    if len(values) > 1_000_000:
+        picks = np.random.default_rng(0).integers(0, len(values), 1_000_000)
+        sample = values[picks]
+    low, high = (float(v) for v in np.percentile(sample, (2.0, 98.0)))
+    smallest, largest = float(values.min()), float(values.max())
+    if high <= low:
+        # Only a few distinct values, a mask or ids: the extremes it is
+        low, high = smallest, largest
+    if high <= low:
+        high = low + 1.0
+    viz_set(obj, mod, panel, "From Min", low)
+    viz_set(obj, mod, panel, "From Max", high)
+    VIZ_RANGES[(obj.name, panel)] = (name, smallest, largest)
+    return low, high
+
+
+def viz_pick_source(obj, mod, panel, name):
+    """A heatmap or influence source picked: read it, fit the range to it,
+    and turn Invert on for values where low is what matters."""
+    viz_set_attribute(obj, mod, panel, "Source", name)
+    viz_set(obj, mod, panel, "Invert", name in VIZ_LOW_IS_HOT)
+    viz_auto_range(obj, mod, panel)
+    setattr(obj.pc_viz, VIZ_FITTED[panel], name)
+
+
+# Which attribute each range was last fitted to, as the name of the
+# PC_VizSettings field keeping it. Kept with the file, so a range set by hand
+# is left alone on reload.
+VIZ_FITTED = {"Heatmap": "fitted_heat", "Influence 1": "fitted_influence_1",
+              "Influence 2": "fitted_influence_2"}
+_VIZ_PENDING = set()
+
+
+def viz_fit_new_sources(obj):
+    """Fits the range of every source picked since its range was fitted.
+
+    A source picked in the panel is fitted on the spot; this catches the
+    ones picked in the modifier tab, which would otherwise keep the old
+    range, often 0 to 1, and squeeze every point into one size or color.
+    """
+    mod = viz_modifier(obj)
+    if mod is None or mod.node_group.get("pc_viz") != VIZ_VERSION:
+        return
+    for panel, prop in VIZ_FITTED.items():
+        name = viz_attribute(mod, panel, "Source")
+        if (name and name != getattr(obj.pc_viz, prop)
+                and name in obj.data.attributes):
+            viz_pick_source(obj, mod, panel, name)
+
+
+def viz_fit_pending():
+    for name in tuple(_VIZ_PENDING):
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            viz_fit_new_sources(obj)
+    _VIZ_PENDING.clear()
+    return None
+
+
+def viz_watch(scene, depsgraph):
+    """After every change, looks for visualized clouds whose source may have
+    been picked in the modifier tab. Fitting writes to the modifier, which
+    is not done while Blender is still handing out this update, so it waits
+    for a timer."""
+    for update in depsgraph.updates:
+        obj = update.id
+        if (isinstance(obj, bpy.types.Object) and obj.type == 'MESH'
+                and viz_modifier(obj.original) is not None):
+            _VIZ_PENDING.add(obj.original.name)
+    if _VIZ_PENDING and not bpy.app.timers.is_registered(viz_fit_pending):
+        bpy.app.timers.register(viz_fit_pending, first_interval=0.0)
+
+
+def viz_show_materials(context):
+    """Puts viewports that cannot show materials into Material Preview.
+    True if one was switched."""
+    switched = False
+    screen = getattr(context, "screen", None)
+    for area in getattr(screen, "areas", ()):
+        if area.type != 'VIEW_3D':
+            continue
+        for space in area.spaces:
+            if space.type == 'VIEW_3D' and space.shading.type in (
+                    'SOLID', 'WIREFRAME'):
+                space.shading.type = 'MATERIAL'
+                switched = True
+    return switched
+
+
+def viz_enable(obj):
+    """Gives obj the Visualize modifier, set up for the cloud, and returns
+    it. One already there is kept with its settings, unless it is on an
+    older node group, which it is moved off with fresh settings."""
+    group = viz_group()
+    mod = viz_modifier(obj)
+    if mod is not None and mod.node_group is group:
+        return mod
+    if mod is None:
+        mod = obj.modifiers.new(VIZ_MODIFIER, 'NODES')
+    mod.node_group = group
+    # Last in the stack and kept there, so whatever a tool adds after it
+    # is still worked out before the points are made
+    mod.use_pin_to_last = True
+    # Off in edit mode, where the bare vertices are what gets edited and a
+    # big cloud would be rebuilt on every change
+    mod.show_in_editmode = False
+
+    viz_set(obj, mod, None, "Spacing", viz_spacing(obj))
+    colors = obj.data.color_attributes
+    name = colors.default_color_name or colors.active_color_name
+    if not name and len(colors):
+        name = colors[0].name
+    if name:
+        viz_set_attribute(obj, mod, "True Color", "Color", name)
+    else:
+        viz_set_menu(obj, mod, None, "Color By", "Solid")
+    return mod
+
+
+class PC_VizOperator:
+    """What every Visualize button shares: a mesh to act on, Blender 5."""
+
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (bpy.app.version >= VIZ_MIN_BLENDER
+                and bool(viz_targets(context)))
+
+
+class MESH_OT_Visualize(PC_VizOperator, bpy.types.Operator):
+    bl_idname = "mesh.pc_visualize"
+    bl_label = "Visualize"
+    bl_description = (
+        "Shows the selected clouds as points in their own colors, or hides "
+        "them again. The first press adds a Geometry Nodes modifier, sized "
+        "from the measured point spacing, that leaves the mesh itself "
+        "untouched, so every other tool keeps working while it is shown. "
+        "Hiding keeps all its settings for the next press")
+
+    def execute(self, context):
+        targets = viz_targets(context)
+        mod = viz_modifier(targets[0])
+        turn_on = (mod is None or not mod.show_viewport
+                   or mod.node_group.get("pc_viz") != VIZ_VERSION)
+        if not turn_on:
+            for obj in targets:
+                mod = viz_modifier(obj)
+                if mod is not None:
+                    mod.show_viewport = mod.show_render = False
+            self.report({'INFO'}, f"Visualize hidden on {len(targets)} "
+                                  f"object(s), settings kept")
+            return {'FINISHED'}
+
+        for obj in targets:
+            mod = viz_enable(obj)
+            mod.show_viewport = mod.show_render = True
+        note = f"Visualizing {len(targets)} object(s)"
+        if viz_show_materials(context):
+            note += ", viewport switched to Material Preview to show colors"
+        self.report({'INFO'}, note)
+        return {'FINISHED'}
+
+
+class MESH_OT_VizRemove(PC_VizOperator, bpy.types.Operator):
+    bl_idname = "mesh.pc_viz_remove"
+    bl_label = "Remove Visualize"
+    bl_description = (
+        "Takes the Visualize modifier off the selected clouds, settings and "
+        "all. The cloud itself was never changed by it")
+
+    def execute(self, context):
+        removed = 0
+        for obj in viz_targets(context):
+            mod = viz_modifier(obj)
+            if mod is not None:
+                obj.modifiers.remove(mod)
+                removed += 1
+        self.report({'INFO'}, f"Visualize removed from {removed} object(s)")
+        return {'FINISHED'}
+
+
+class MESH_OT_VizMeasure(PC_VizOperator, bpy.types.Operator):
+    bl_idname = "mesh.pc_viz_measure"
+    bl_label = "Measure Spacing"
+    bl_description = (
+        "Measures the point spacing of the selected clouds again, after "
+        "Rescale, Fill or Growth changed it, so Size 1 still makes the "
+        "points touch")
+
+    def execute(self, context):
+        done = []
+        for obj in viz_targets(context):
+            mod = viz_modifier(obj)
+            if mod is not None:
+                spacing = viz_spacing(obj)
+                viz_set(obj, mod, None, "Spacing", spacing)
+                done.append(spacing)
+        if not done:
+            self.report({'WARNING'}, "Nothing selected is visualized")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Spacing measured: {done[0]:.4g}")
+        return {'FINISHED'}
+
+
+class MESH_OT_VizAutoRange(PC_VizOperator, bpy.types.Operator):
+    bl_idname = "mesh.pc_viz_auto_range"
+    bl_label = "Auto Range"
+    bl_description = (
+        "Fits the range to the values on the cloud, leaving out the lowest "
+        "and highest 2% so a few strays do not flatten the rest")
+
+    panel: bpy.props.StringProperty(options={'SKIP_SAVE'})
+
+    def execute(self, context):
+        obj = viz_targets(context)[0]
+        mod = viz_modifier(obj)
+        if mod is None or self.panel not in ("Heatmap",) + VIZ_INFLUENCES:
+            return {'CANCELLED'}
+        fitted = viz_auto_range(obj, mod, self.panel)
+        if fitted is None:
+            self.report({'WARNING'}, "Pick values the cloud has first")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Range {fitted[0]:.4g} to {fitted[1]:.4g}")
+        return {'FINISHED'}
+
+
+def attribute_number(name):
+    """The enum number of an attribute, made from its name so a tool adding
+    an attribute does not shift a choice onto another one.
+
+    Kept below 2**24: a dropdown hands the picked number back through a
+    float, which only holds whole numbers that far exactly. A bigger one
+    came back off by a few, matched no item, and the pick was lost. 0 is
+    left free for the 'nothing picked' item.
+    """
+    return zlib.crc32(name.encode()) % 0xFFFFFF + 1
+
+
+# Blender keeps the strings of a dynamic enum only as long as Python does
+_VIZ_ITEMS = {}
+
+
+def viz_source_enum(prop, panel, name, kinds, pick=None, toggle=False):
+    """An enum on Object.pc_viz that reads and writes which attribute one
+    source input of the modifier reads. It keeps nothing of its own: the
+    modifier is the one place the choice lives.
+
+    With toggle, the enum also switches the panel's Use: picking values
+    turns it on and None turns it off, so a size influence can never be on
+    without values to read, which would shrink every point to Low.
+
+    The items are numbered by attribute_number, like get_attributes_enum.
+    """
+    number = attribute_number
+
+    def items(self, context):
+        obj = self.id_data
+        found = []
+        mod = viz_modifier(obj)
+        if obj.type == 'MESH':
+            for attr in obj.data.attributes:
+                if (attr.data_type in kinds and not attr.name.startswith(".")
+                        and attr.name != VIZ_COLOR_ATTR):
+                    found.append((attr.name, attr.name, "", 'NONE',
+                                  number(attr.name)))
+        current = viz_attribute(mod, panel, name) if mod else ""
+        if current and all(item[0] != current for item in found):
+            found.append((current, f"{current} (missing)", "", 'ERROR',
+                          number(current)))
+        if toggle:
+            nothing = "None"
+        elif kinds == VIZ_COLOR_TYPES:
+            nothing = "Pick a color attribute"
+        else:
+            nothing = "Pick values"
+        found.insert(0, ("NONE", nothing, "", 'NONE', 0))
+        _VIZ_ITEMS[prop] = found
+        return found
+
+    def get(self):
+        mod = viz_modifier(self.id_data)
+        if mod is None or (toggle and not viz_get(mod, panel, "Use", False)):
+            return 0
+        current = viz_attribute(mod, panel, name)
+        return number(current) if current else 0
+
+    def set(self, value):
+        obj = self.id_data
+        mod = viz_modifier(obj)
+        if mod is None:
+            return
+        if toggle:
+            viz_set(obj, mod, panel, "Use", value != 0)
+        if value == 0:
+            return
+        for item in _VIZ_ITEMS.get(prop, ()):
+            if item[4] == value:
+                if pick is None:
+                    viz_set_attribute(obj, mod, panel, name, item[0])
+                else:
+                    pick(obj, mod, panel, item[0])
+                return
+
+    return bpy.props.EnumProperty(
+        name=name, items=items, get=get, set=set,
+        description="The attribute this reads, picked from the ones on the "
+                    "cloud")
+
+
+class PC_VizSettings(bpy.types.PropertyGroup):
+    """Pickers for the attributes the Visualize modifier reads."""
+
+    color: viz_source_enum("color", "True Color", "Color", VIZ_COLOR_TYPES)
+    heat: viz_source_enum("heat", "Heatmap", "Source", VIZ_NUMERIC_TYPES,
+                          viz_pick_source)
+    ids: viz_source_enum("ids", "ID Colors", "ID", VIZ_ID_TYPES)
+    influence_1: viz_source_enum("influence_1", "Influence 1", "Source",
+                                 VIZ_NUMERIC_TYPES, viz_pick_source, True)
+    influence_2: viz_source_enum("influence_2", "Influence 2", "Source",
+                                 VIZ_NUMERIC_TYPES, viz_pick_source, True)
+    fitted_heat: bpy.props.StringProperty(options={'HIDDEN'})
+    fitted_influence_1: bpy.props.StringProperty(options={'HIDDEN'})
+    fitted_influence_2: bpy.props.StringProperty(options={'HIDDEN'})
+
+
 # --- 3. UI SYNC & PANEL ---
 
 # Blender keeps the strings of a dynamic enum only as long as Python does
@@ -5506,7 +6437,7 @@ def get_attributes_enum(self, context):
             if (attr.domain == 'POINT'
                     and attr.data_type in ('FLOAT_COLOR', 'BYTE_COLOR')):
                 items.append((attr.name, attr.name, "", 'NONE',
-                              zlib.crc32(attr.name.encode()) & 0x7FFFFFFF))
+                              attribute_number(attr.name)))
     _ATTRIBUTE_ITEMS[:] = items if items else [("NONE", "None", "", 'NONE', 0)]
     return _ATTRIBUTE_ITEMS
 
@@ -5988,6 +6919,162 @@ class MESH_PT_FillVolumePanel(PC_ToolPanel, bpy.types.Panel):
             self.note(layout, scene.pc_fill_status)
 
 
+def viz_prop(layout, mod, panel, name, **kw):
+    """Draws one input of the modifier, the same field the modifier tab
+    shows, so a change in either is a change in both. Labelled with the
+    input's name, as drawn bare it would show the socket's id."""
+    kw.setdefault("text", name)
+    layout.prop(mod, f'["{viz_key(mod, panel, name)}"]', **kw)
+
+
+class PC_VizPanel(PC_ToolPanel):
+    """The Visualize sections, which all draw the active cloud's modifier."""
+
+    @staticmethod
+    def viz(context):
+        """(object, modifier) of the active cloud, either may be None."""
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH':
+            return None, None
+        mod = viz_modifier(obj)
+        if mod is not None and mod.node_group.get("pc_viz") != VIZ_VERSION:
+            mod = None   # an older group: Visualize moves it onto this one
+        return obj, mod
+
+    def remap(self, layout, obj, mod, panel, prop, text=""):
+        """The block shared by the heatmap and the size influences: what to
+        read, the range it is read over and the curve laid on it."""
+        layout.prop(obj.pc_viz, prop, text=text)
+        name = viz_attribute(mod, panel, "Source")
+        if not name:
+            if not any(a.data_type in VIZ_NUMERIC_TYPES
+                       and not a.name.startswith(".")
+                       for a in obj.data.attributes):
+                self.note(layout, "No values on this cloud yet, run "
+                                  "Thickness or Spectrum > Analyze")
+            return
+        if name not in obj.data.attributes:
+            col = layout.column(align=True)
+            col.scale_y = 0.55
+            col.alert = True
+            col.label(text=f"'{name}' is not on this cloud")
+            if name in VIZ_SOURCES:
+                col.label(text=f"run {VIZ_SOURCES[name]}")
+
+        row = layout.row(align=True)
+        viz_prop(row, mod, panel, "From Min", text="Min")
+        viz_prop(row, mod, panel, "From Max", text="Max")
+        row.operator("mesh.pc_viz_auto_range", text="",
+                     icon='AUTO').panel = panel
+        known = VIZ_RANGES.get((obj.name, panel))
+        if known is not None and known[0] == name:
+            self.note(layout, f"values run {known[1]:.4g} to {known[2]:.4g}")
+
+        row = layout.row(align=True)
+        viz_prop(row, mod, panel, "Curve", expand=True)
+        viz_prop(row, mod, panel, "Invert", text="", icon='ARROW_LEFTRIGHT',
+                 toggle=True)
+        if viz_menu(mod, panel, "Curve", VIZ_CURVES) == "Steps":
+            viz_prop(layout, mod, panel, "Steps")
+
+
+class MESH_PT_VisualizePanel(PC_VizPanel, bpy.types.Panel):
+    """The switch, the size and the color sit on the section itself, which
+    is all most clouds need. Size by attribute is a sub panel below it,
+    closed until wanted."""
+
+    bl_label = "Visualize"
+    bl_idname = "MESH_PT_VisualizePanel"
+    bl_options = set()
+
+    def draw_header(self, context):
+        pass
+
+    def draw(self, context):
+        layout = self.layout
+        if bpy.app.version < VIZ_MIN_BLENDER:
+            self.note(layout, "Visualize needs Blender 5.0 or later")
+            return
+        obj, mod = self.viz(context)
+        if obj is None:
+            self.note(layout, "Make a point cloud active to visualize it")
+            return
+
+        shown = mod is not None and mod.show_viewport
+        row = layout.row(align=True)
+        row.operator("mesh.pc_visualize", text="Visualize",
+                     icon='HIDE_OFF' if shown else 'HIDE_ON', depress=shown)
+        if viz_modifier(obj) is not None:
+            row.operator("mesh.pc_viz_remove", text="", icon='X')
+        if mod is None:
+            self.note(layout, "Shows the cloud as points in its own colors")
+            return
+
+        row = layout.row(align=True)
+        viz_prop(row, mod, None, "Size")
+        row.operator("mesh.pc_viz_measure", text="", icon='FILE_REFRESH')
+        self.note(layout, f"spacing {viz_get(mod, None, 'Spacing', 0.0):.4g}")
+
+        viz_prop(layout, mod, None, "Color By", text="")
+        mode = viz_menu(mod, None, "Color By", VIZ_COLOR_MODES)
+        col = layout.column(align=True)
+        if mode == "True Color":
+            col.prop(obj.pc_viz, "color", text="")
+            viz_prop(col, mod, "True Color", "Brightness")
+            viz_prop(col, mod, "True Color", "Saturation")
+            if not len(obj.data.color_attributes):
+                self.note(layout, "This cloud has no colors, pick another "
+                                  "Color By")
+        elif mode == "Heatmap":
+            self.remap(col, obj, mod, "Heatmap", "heat")
+            viz_prop(layout, mod, "Heatmap", "Palette", text="")
+        elif mode == "ID Colors":
+            col.prop(obj.pc_viz, "ids", text="")
+            viz_prop(col, mod, "ID Colors", "Seed")
+            if not viz_attribute(mod, "ID Colors", "ID"):
+                self.note(layout, "Cluster ids come from Spatial or Spectrum "
+                                  "> Cluster")
+        else:
+            viz_prop(col, mod, "Solid", "Solid Color", text="")
+
+        viz_prop(layout, mod, None, "Shading", expand=True)
+        viz_prop(layout, mod, "Display", "Viewport Density", slider=True)
+
+
+class MESH_PT_VizSizePanel(PC_VizPanel, bpy.types.Panel):
+    bl_label = "Size by Attribute"
+    bl_parent_id = "MESH_PT_VisualizePanel"
+    bl_idname = "MESH_PT_VizSizePanel"
+    icon = 'DRIVER_DISTANCE'
+
+    @classmethod
+    def poll(cls, context):
+        return cls.viz(context)[1] is not None
+
+    def draw(self, context):
+        layout = self.layout
+        obj, mod = self.viz(context)
+        used = False
+        for number, (panel, prop) in enumerate(
+                zip(VIZ_INFLUENCES, ("influence_1", "influence_2"))):
+            if number and not used:
+                break   # the second one is offered once the first is on
+            col = layout.column(align=True)
+            text = "Scale by" if not number else "And by"
+            if not viz_get(mod, panel, "Use", False):
+                col.prop(obj.pc_viz, prop, text=text)
+                continue
+            used = True
+            self.remap(col, obj, mod, panel, prop, text)
+            if viz_attribute(mod, panel, "Source"):
+                row = col.row(align=True)
+                viz_prop(row, mod, panel, "Smallest", text="Low ×")
+                viz_prop(row, mod, panel, "Largest", text="High ×")
+            layout.separator()
+        if used:
+            viz_prop(layout, mod, "Display", "Hide Below")
+
+
 # --- 4. REGISTRATION ---
 
 classes = (MESH_OT_CancelTask, MESH_OT_InvertSelection, MESH_OT_PickColor, MESH_OT_Heatmap, MESH_OT_AnalyzeColors, MESH_OT_SelectNoise,
@@ -6004,7 +7091,10 @@ classes = (MESH_OT_CancelTask, MESH_OT_InvertSelection, MESH_OT_PickColor, MESH_
            MESH_PT_ThicknessPanel, MESH_PT_SpectrumPanel,
            # The Modify tools are listed in the order they are drawn in
            MESH_PT_RescalePanel, MESH_PT_GrowthPanel,
-           MESH_PT_FillVolumePanel, MESH_PT_BooleanPanel)
+           MESH_PT_FillVolumePanel, MESH_PT_BooleanPanel,
+           PC_VizSettings, MESH_OT_Visualize, MESH_OT_VizRemove,
+           MESH_OT_VizMeasure, MESH_OT_VizAutoRange,
+           MESH_PT_VisualizePanel, MESH_PT_VizSizePanel)
 
 def register():
     bpy.types.Scene.pc_vid_path = bpy.props.StringProperty(
@@ -6307,8 +7397,18 @@ def register():
         name="Running", default=False,
         description="True while growth is in progress")
     for cls in classes: bpy.utils.register_class(cls)
+    bpy.types.Object.pc_viz = bpy.props.PointerProperty(
+        type=PC_VizSettings,
+        description="Pickers for the attributes Visualize reads")
+    bpy.app.handlers.depsgraph_update_post.append(
+        bpy.app.handlers.persistent(viz_watch))
 
 def unregister():
+    if viz_watch in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(viz_watch)
+    if bpy.app.timers.is_registered(viz_fit_pending):
+        bpy.app.timers.unregister(viz_fit_pending)
+    if hasattr(bpy.types.Object, "pc_viz"): del bpy.types.Object.pc_viz
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
     props = ['pc_radius', 'pc_min_points', 'pc_color_attr_enum', 'pc_color_tol', 'pc_material_mode',
              'pc_ref_color', 'pc_bool_container', 'pc_bool_cloud',
